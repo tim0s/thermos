@@ -1,0 +1,212 @@
+---
+title: "Jim's Weatherstation"
+output: html_document
+---
+
+![HackRF One](hackrf.jpg)
+
+As a birthday present to myself I bought a HackRF One. The HackRF is a Software 
+Defined Radio, which can send/receive anything between 1 MHz and 6 GHz, with a 
+sampling frequency up to 20 MSps. It costs about $300, however, everything
+described in here can be replicated with a $20 RTL-SDR dongle (which is unable 
+to transmit and has a lower sample rate). An SDR works by mixing i.e., multiplying 
+the received signal with a sine and cosine of (roughly) the target frequency. 
+The results are two samples, called I and Q.
+
+While visiting my friend Jim, he showed me his weather station, which displays up
+to 4 inputs from battery powered temperature and humidity sensors. As a first project
+to play with the HackRF I decided to try and decode the data sent by the sensors.
+
+![The Sensor, front and back.](sensor.jpg)
+
+## Turning Radiowaves into Bits
+
+The sensor sends a burst of data on 433.9 MHz once
+every minute. I recorded such bursts in [gqrx](gqrx.dk) and parsed the gqrx output
+with a simple program (isolate_signal.c) to turn the I/Q samples into complex
+numbers readable by R. 
+
+```{r}
+setwd("~/HackRF/thermos/")
+library("ggplot2")
+sig <- read.table("samples/squelched_gqrx_20161212_191815_432000000_8000000_fc.raw")
+len <- length(sig$V1)
+data = data.frame(sample=seq(1, len), magnitude=abs(sig$V1))
+```
+
+Since the FCC documentation tells us that the sender uses ASK, we only
+care about the magnitude of each sample. If we plot a single burst
+(decimated by a factor of 100) we get
+
+```{r}
+# lets look at the data
+ggplot(data=data[seq(1, length(data$sample), 100),], aes(x=sample, y=magnitude)) + geom_line()
+```
+
+There are many points around zero, even during the burst, thus I assume
+the sender actually uses OOK, and everything above half the recorded maximum
+will be regarded as "on", everything below as "off". We apply a moving average
+to get rid of outlier samples, then consider everything above 0.75 the maximum value a high sample, represented by a one, everything else zero.
+
+
+```{r}
+moving_average <- function(x,n=50){filter(x,rep(1/n,n), sides=2)}
+data$magnitude = moving_average(data$magnitude)
+data = data[complete.cases(data), ]
+data$bin = as.integer(data$magnitude > 0.75*max(data$magnitude))
+ggplot(data=data[seq(5e5, 7e5),], aes(x=sample, y=bin)) + geom_line() + geom_point()
+```
+
+That actually looks like data (note that this is also a zoomed in plot).
+It seems there are short and long pulses. Let us take a look at the pulse
+lengths (after removing the silence at the start/end):
+
+```{r}
+rledata = rle(data$bin)
+rledata = data.frame(idx=seq(1, length(rledata$values)), lengths=rledata$lengths, values=rledata$values)
+rledata = rledata[seq(2, length(rledata$idx)-1), ] #remove the "silence" before and after
+divider =  min(rledata$lengths) + (max(rledata$lengths) - min(rledata$lengths)) / 2  # find the middle between long and short runs
+ggplot(data=rledata, aes(x=idx, y=lengths, color=as.factor(values))) + 
+  geom_point() + 
+  geom_hline(yintercept=divider) +
+  scale_color_discrete("Value") +
+  scale_x_continuous("Pulse") +
+  scale_y_continuous("Pulse Length")
+```
+
+Low periods (Value 0) seem to be always a little bit longer than high
+periods (Value 1). Thus, there are only two different period lengths,
+which we refer to as "short" and "long". We can safely classify them by
+checking if they are above or below min+(max-min)/2.  We can now encode the
+data in a bit string, long periods will be represented as a value beeing
+repeated twice.
+
+```{r}
+repcnt = as.integer(rledata$lengths > divider) + 1
+bitstr = paste(rep(rledata$values, repcnt), sep="", collapse="")
+bitstr
+```
+
+The fact that we have only two different period lengths, hints that the
+zeroes and ones are not actually data bits. A common encoding which leads
+to this pattern is Manchester coding, which xors the data stream with the
+clock. Each data bit is an entire clock period long. 
+To assist clock recovery, data packets usually start with a 
+lead-in of all ones or all zeroes. If the Manchester code assumption is
+correct, we should have an even number of bits in our string, and when
+broken into two character sequences, there should be only "10" and "01".
+
+```{r}
+bigrams = sapply(seq(from=1, to=nchar(bitstr), by=2), function(i) substr(bitstr, i, i+1))
+bigrams
+unique(bigrams)
+```
+This seems to fit :). Now the only decision to make is how to map those
+bigrams to 0 and 1. According to Wikipedia, both conventions exist, but
+it seems more common to use "high/low" to encode 1, so let's go with that.
+
+```{r}
+bits = paste(match(bigrams, c("01", "10")) - 1, sep="", collapse="")
+bits
+```
+
+Turns out the same data is transmitted three times.
+
+```{r, echo=FALSE}
+decoded = c()
+for (k in 0:2) {decoded[k+1]=substr(bits, 1+k*65, (k+1)*65)}
+decoded
+```
+
+## Let's automate that
+
+To identify the meaning of each bit, we need a lot more samples, at
+different temperatures and humidities. To get that, it would be nice to
+further automate our toolchain. I considered three options for that:
+
+* Writing a HackRF library for GNU R
+* Writing the decoder code in a language that has libhackrf bindings
+* Using GNU Radio, a toolbox for SDR projects
+
+While R is great to take an initial look at a recorded signal, it is
+probably not a good choice for decoding a signal in real time, since
+R works with static chunks of data, not with a data stream.
+
+Writing the decoder code from scratch is labor-intensive and hard to debug
+for the same reason (I tried, after hitting some snags with gnu radio),
+for some things it's really nice to have a "animated" plot of your signal
+possibly the ability to change some values using simple sliders, etc. Coding
+that in C or Perl is a work I did not want to do.
+
+So I decided to take the third option (which has the capabilities described
+above), and basically replicate what we did above using GNU Radio. I will
+document my grc file seperately. My main issue with GNU Radio was that I did
+not find a good way to do the run-length encoding part. Possibly there are
+better/other ways to do the clock-recovery, e.g., there is a MM Clock
+Recovery Block, but like many things in GNU Radio, if you do not already know
+what it does, GNU Radio will surely not explain it to you, and as a result
+I did not get that to work. Then I tried making my own Run Lenght Encoder OOT
+GNU Radio block, but for some reason even the simplest OOT modules I built
+did not work in the GNU Radio Companion GUI, a bug that others have hit as
+well and no solution was found yet, aparently because the bug was not
+reproducible. I solved this by using embedded python blocks, i.e., a generic
+block whichs behaviour is defined by python code given by the user.
+
+## Turning Bits into Data
+
+After I got that to work, I collected some samples while holding the
+temperature sensor in my hand to warm it up, and then placing it on a space
+heater (since samples are collected only once a minute the jump in 
+temperature is quite drastic). The last two columns are the temperature
+and humidity values I read on the sensors display while recording the
+samples (could contain minor erros).
+
+```
+111111111110101000101100000010010 010001011000 00011011 10010010 0000  71.2 27
+111111111110101000101100000010010 010001011001 00100010 00010010 0000  71.3 34
+111111111110101000101100000010010 010001101010 00100011 11101010 0000  73.0 35
+111111111110101000101100000010010 010010001011 00100001 11100100 0000  76.0 28
+111111111110101000101100000010010 010010001011 00011011 00010111 0000  76.0 27
+111111111110101000101100000010010 010010001011 00011000 00100111 0000  76.3 24
+111111111110101000101100000010010 010101110110 00001101 10110101 0000  99.8 13
+111111111110101000101100000010010 010101110100 00001101 00110011 0000  99.6 13
+111111111110101000101100000010010 010110001011 00001101 00101000 0000  101.x 13
+```
+Since the first 34 bits never change, I labelled them as header for now. 
+The first thing I spottet was the humidity value encoded in 8 bits near
+the end of each packet, before a value that seems to have no correlation
+with the data. The temperature was a bit harder to figure out. I assumed
+fixed-point arithmetic is used here. If we plot the second column 
+(translated to decimal) and the values read from the display, we see
+very good correlation:
+
+```{r}
+library("reshape2")
+recvd = c(1112, 1113, 1130, 1163, 1163, 1163, 1398, 1396, 1419)
+read = c(71.2,  71.3,  73.0,  76.0,  76.0,  76.3,  99.8,  99.6, 101.0)
+samp = seq(1, length(recvd))
+data = data.frame(recvd, read, samp)
+mdata = melt(data, id.vars="samp", variable.name="obtained")
+ggplot(data=mdata, aes(x=samp, y=value)) + geom_point() + geom_line() + facet_wrap(~ obtained, scale="free_y")
+```
+
+In fact if we divide the received data by 10 (no need to transmit floating point values)
+and subtract 40 (no need to transmit negative values, unless it gets _really_ cold) we get
+
+```{r}
+data$recvd = data$recvd/10 - 40
+mdata = melt(data, id.vars="samp", variable.name="obtained")
+ggplot(data=mdata, aes(x=samp, y=value, color=obtained)) + geom_point() + geom_line()
+```
+
+The small errors in samples 4 and 5 are very likely just
+me reading the display slightly before/after the actual transmission. For the last sample
+I forgot to read the last digit and arbitrarily put it down as zero.
+
+The last changing byte in the transmission (before the 0000) is maybe some sort of
+checksum, which I have not yet reverse engineered. Other things we have not looked at
+are how the channel selection and selection of celsius vs fahrenheit mode affect the
+transmission: As documented on the back side of the sensor, there are four DIP switches
+on the inside, which allow to select one out of eight channels for each sensor, as well
+as the temperature scale the unit should use. All samples above used channel 3, since
+that was the setting the sensor was in when I got it.
