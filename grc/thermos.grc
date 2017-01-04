@@ -695,7 +695,7 @@ class blk(gr.basic_block):  # other base classes are basic_block, decim_block, i
         outidx = 0;
         inidx = 0;
 
-        while inidx &lt; len(input_items[0]) and outidx &lt; len(output_items[0]):
+        while inidx &lt; min(len(input_items[0]), len(input_items[1]))  and outidx &lt; len(output_items[0]):
             if self.length == 0:
                 self.value = input_items[0][inidx];
                 self.length = input_items[1][inidx];

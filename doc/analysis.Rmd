@@ -27,9 +27,8 @@ with a simple program (isolate_signal.c) to turn the I/Q samples into complex
 numbers readable by R. 
 
 ```{r}
-setwd("~/HackRF/thermos/")
 library("ggplot2")
-sig <- read.table("samples/squelched_gqrx_20161212_191815_432000000_8000000_fc.raw")
+sig <- read.table("../samples/squelched_gqrx_20161212_191815_432000000_8000000_fc.raw.gz")
 len <- length(sig$V1)
 data = data.frame(sample=seq(1, len), magnitude=abs(sig$V1))
 ```
@@ -210,3 +209,223 @@ transmission: As documented on the back side of the sensor, there are four DIP s
 on the inside, which allow to select one out of eight channels for each sensor, as well
 as the temperature scale the unit should use. All samples above used channel 3, since
 that was the setting the sensor was in when I got it.
+
+To ivestigate further, I took some samples for different channel / unit settings. Since we
+already figured out the temperature / humidity parts, I included the values displayed
+for those only in some of the samples:
+
+```{r}
+data <- read.table("samples_pp.dat", header=T, colClasses=c("character", rep("numeric",3), "factor"))
+```
+
+
+Let's split the packet into individual bits and let us identify bits which always are the same.
+
+```{r}
+splitString <- function(x) {strsplit(as.character(x), "")}
+bitstrToBits <- function(x) {mapply(as.numeric, splitString(x))}
+x <- bitstrToBits(data$packet)
+```
+
+Now each row of x corresponds to one bit position in the input, 
+if we calculate the sum over the rows we can see if the bit is 
+always 1 (sum = #cols) or always zero (sum = 0) or variable (sum > 0 and sum < 1)
+
+```{r}
+bitprob <- apply(x, 1, function(x){sum(x)/length(x)})
+is.wholenumber <- function(x, tol = .Machine$double.eps^0.5)  abs(x - round(x)) < tol
+constantbits = sapply(bitprob, is.wholenumber)
+
+bpdata = data.frame(const=constantbits, prob=bitprob, pos=seq(1:length(bitprob)))
+ggplot(data=bpdata, aes(x=pos, y=prob, color=as.factor(const))) + 
+     geom_point() + 
+     scale_color_discrete("Constant") +
+     scale_x_continuous("Bit Position") +
+     scale_y_continuous("Probability of being 1")
+```
+
+From that diagram and our previous observations, we can see that
+
+ * bits [ 1:21] are constant, let's name them start_frame
+ * bits [62:65] are constant, let's name them end_frame
+ * bits [46:53] contain the humidity value, thus the constant zero at 46, since humidity > 100% is rare :)
+ * bits [34:45] contain a biased temperature value
+
+We now have two unknown, non-constant parts. however, if we repeat the above
+experiments only with samples from the channel 3, farenheit configuration (because thats what we have most of) we see that bits 22-33 are constant, thus it seems to be justified
+to call
+
+ * bits [22:33] configuration_bits
+ * bits [54:61] checksum_bits 
+
+Let's break the packet into those parts and perform the conversions we already know about
+
+```{r}
+# lets break up our packets as described above
+data$start_frame = substr(data$packet, 1, 21)
+data$end_frame = substr(data$packet, 62, 65)
+data$humidity = substr(data$packet, 46, 53)
+data$temperature = substr(data$packet, 34, 45)
+data$config = substr(data$packet, 22, 33)
+data$checksum = substr(data$packet, 54, 61)
+
+
+# remove useless columns
+data$packet = NULL;
+data$start_frame = NULL;
+data$end_frame = NULL;
+
+# convert humidity / temperature to decimal values
+BinToDec <- function(x) {  sum(2^(which(rev(unlist(strsplit(as.character(x), "")) == 1))-1)) }
+t = sapply(data$humidity, BinToDec)
+data$humidity = as.vector(t)
+t = sapply(data$temperature, BinToDec)
+data$temperature = as.vector(t) / 10 - 40
+```
+
+Note that even if the unit is set to celsius, the transmitted value is in F, thus the 
+conversion happens only when the value is displayed (23C = 73.4F).
+
+```{r}
+data[data$unit == "c",]
+```
+
+To figure out how the channels / units map to the config field, let's get rid of all unneccessary data first
+
+```{r}
+data$rtemp <- NULL
+data$rhum <- NULL
+data$temperature <- NULL
+data$humidity <- NULL
+data$checksum <- NULL
+data = unique(data)
+```
+
+At this point I could not see a clear pattern in the data
+```{r}
+data
+```
+
+If we sort the data by channel however, a pattern emerges
+```{r}
+data[order(data$chan),]
+```
+
+The last three bits of the config field (31:33 in the original packet) are equal to the
+channel number - 1 and bit 30 is always zero (of course we already saw that in the very
+first plot, but didn't really pay attention) note that the last three bits directly
+correspond to the position of the first three dip switches as documented on the back of
+the receiver, down=0 and up=1 Another weird thing I noticed is that for the ch=8,c case we
+have two values instead of one!
+
+```{r}
+data$channel = substr(data$config, 9, 12)
+t = sapply(data$channel, BinToDec)
+data$channel = as.vector(t)
+data$config = substr(data$config, 1,8)
+data$chan = NULL
+```
+
+To solve the remaining mysteries I recorded a lot more samples. This time I
+turned the sensor on and off multiple times while recording data for the same
+configuration.
+
+```{r}
+data = read.table("samples_new.txt", colClasses = "character", col.names = "packet")
+data = unique(data)
+
+# lets break up our packets as described above
+data$start_frame = substr(data$packet, 1, 21)
+data$end_frame = substr(data$packet, 62, 65)
+data$humidity = substr(data$packet, 46, 53)
+data$temperature = substr(data$packet, 34, 45)
+data$config = substr(data$packet, 22, 29)
+data$channel = substr(data$packet, 30, 33)
+data$checksum = substr(data$packet, 54, 61)
+
+# convert humidity / temperature to decimal values
+t = sapply(data$humidity, BinToDec)
+data$humidity_val = as.vector(t)
+t = sapply(data$temperature, BinToDec)
+data$temperature_val = as.vector(t) / 10 - 40
+t = sapply(data$channel, BinToDec)
+data$channel_val = as.vector(t)
+t = sapply(data$config, BinToDec)
+data$config_val = as.vector(t)
+
+
+ggplot(data=data, aes(x=seq(1, length(data$packet)), y=as.factor(config), color=as.factor(channel))) +
+  geom_point() +
+  scale_x_continuous("Packet Index") +
+  scale_y_discrete("Config Bits") +
+  scale_color_discrete("Channel")
+```
+
+I conclude that bits [22:29] have nothing to do with the dip switch setting /
+configuration. Every time the sensor is restarted, i.e., by replacing the
+batteries, they take a new, more or less random, value. The randomness does not
+seem too good, since we got the same value 3 times. If I had to guess I would
+suggest the sensor uses the current temperature and or humidity when it is
+powered up as a random seed. The reason why this is done is probably to allow
+neighbours to operate the same weather station and sensors, even on the same
+channels. There is probably a "discovery mode" in which the weather station
+listens to any sensor, and once it found one, it ignores all transmissions on
+the same channel that have different "config" bits.
+
+Now the only thing left is to reverse engineer the checksum part. My initial
+guess was that it is a 8 bit CRC. However, exhaustively searched all possible
+CRC configurations as well as packet subsets to apply the CRC to, and no
+combination matched. Let's try to find two identical packets where only the
+n-th bit is different, and see how that affected the checksum.
+
+```{r}
+hamming_pair <- function(x,y) {
+  if (nchar(x) != nchar(y) ) {warning("x and y do not have the same length")}
+  x = strsplit(x, "")
+  y = strsplit(y, "")
+  x = as.vector(sapply(x, as.numeric, simplify = T))
+  y = as.vector(sapply(y, as.numeric, simplify = T))
+  return(length(x[x != y]))
+}
+
+a = c()
+b = c()
+for (i in seq(1, length(data$packet))) {
+  for (j in seq(1, length(data$packet))) {
+    p1 = data$packet[i];
+    p2 = data$packet[j];
+    p1 = substr(p1, 1, 53)
+    p2 = substr(p2, 1, 53)
+    h = hamming_pair(x=p1, y=p2)
+    if ((h == 1) && (i<j)) {
+      a = append(a, (data$packet[i]))
+      b = append(b, (data$packet[j]))
+    }
+  }
+}
+bitdiffs = data.frame(a=a, b=b)
+bitdiffs$data_a = substr(bitdiffs$a, 22, 53)
+bitdiffs$data_b = substr(bitdiffs$b, 22, 53)
+bitdiffs$chk_a = substr(bitdiffs$a, 54, 61)
+bitdiffs$chk_b = substr(bitdiffs$b, 54, 61)
+
+diffs = c()
+for (i in seq(1, length(bitdiffs$data_a))) {
+  a=bitdiffs$data_a[i]; 
+  b=bitdiffs$data_b[i]; 
+  d=(unlist(strsplit(a, "")) != unlist(strsplit(b, ""))); 
+  diffs=append(diffs, which(d)) 
+}
+bitdiffs$diffs = diffs
+
+diffbits <- function(a, b) {
+  d=(unlist(strsplit(a, "")) != unlist(strsplit(b, ""))); 
+  return(paste(as.integer(d), sep="", collapse=""))
+}
+
+for (i in seq(1, length(bitdiffs$chk_a))) {bitdiffs$diffmask[i] = (diffbits(bitdiffs[i,]$chk_a, bitdiffs[i,]$chk_b))} 
+
+d = unique(data.frame(pos=bitdiffs$diffs, diff=bitdiffs$diffmask))
+d[order(d$pos),]
+```
+
