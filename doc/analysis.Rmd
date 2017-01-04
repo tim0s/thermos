@@ -1,6 +1,8 @@
 ---
 title: "Jim's Weatherstation"
-output: html_document
+output: 
+  html_document: 
+    self_contained: no
 ---
 
 ![HackRF One](hackrf.jpg)
